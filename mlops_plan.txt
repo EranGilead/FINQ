@@ -1,0 +1,895 @@
+# MLOps Infrastructure Plan for FINQ Stock Predictor
+
+## Overview
+
+This document outlines the MLOps infrastructure plan for productionizing the FINQ Stock Predictor system. The plan focuses on scalability, reliability, and maintainability for a financial AI application.
+
+## 1. Containerization Strategy (Docker)
+
+### 1.1 Application Containers
+
+**Training Container:**
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN mkdir -p data/raw data/processed models/saved logs
+
+ENTRYPOINT ["python", "train.py"]
+```
+
+**API Container:**
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### 1.2 Data Pipeline Container
+
+**Data Fetcher Service:**
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY data/ ./data/
+COPY config.py .
+
+CMD ["python", "-m", "data.fetcher"]
+```
+
+### 1.3 Container Orchestration
+
+**Docker Compose for Development:**
+```yaml
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - DEBUG=false
+      - MODEL_CACHE_TTL=3600
+
+  data-fetcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.data
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - postgres
+    environment:
+      - FETCH_SCHEDULE=0 */6 * * *
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=finq_predictor
+      - POSTGRES_USER=finq
+      - POSTGRES_PASSWORD=finq_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
+```
+
+## 2. Experiment Tracking (MLflow)
+
+### 2.1 MLflow Setup
+
+**MLflow Tracking Server:**
+```python
+# mlflow_setup.py
+import mlflow
+from mlflow.tracking import MlflowClient
+
+# Configure MLflow
+mlflow.set_tracking_uri("postgresql://user:password@localhost:5432/mlflow")
+mlflow.set_experiment("finq_stock_predictor")
+
+class MLflowTracker:
+    def __init__(self, experiment_name="finq_stock_predictor"):
+        self.client = MlflowClient()
+        self.experiment_name = experiment_name
+        
+    def log_training_run(self, model, metrics, params, artifacts):
+        with mlflow.start_run():
+            # Log parameters
+            mlflow.log_params(params)
+            
+            # Log metrics
+            mlflow.log_metrics(metrics)
+            
+            # Log model
+            mlflow.sklearn.log_model(model, "model")
+            
+            # Log artifacts
+            for artifact_path, artifact in artifacts.items():
+                mlflow.log_artifact(artifact, artifact_path)
+                
+            return mlflow.active_run().info.run_id
+```
+
+### 2.2 Enhanced Training Script with MLflow
+
+```python
+# train_with_mlflow.py
+from mlflow_setup import MLflowTracker
+
+def train_with_tracking():
+    tracker = MLflowTracker()
+    
+    # Training pipeline
+    # ... existing training code ...
+    
+    # Log experiment
+    run_id = tracker.log_training_run(
+        model=best_model,
+        metrics={
+            'test_auc': test_scores['auc'],
+            'test_accuracy': test_scores['accuracy'],
+            'test_precision': test_scores['precision'],
+            'test_recall': test_scores['recall']
+        },
+        params={
+            'model_type': args.model_type,
+            'max_stocks': args.max_stocks,
+            'feature_count': len(trainer.feature_columns),
+            'training_samples': len(X_train)
+        },
+        artifacts={
+            'feature_importance': 'feature_importance.json',
+            'model_config': 'model_config.yaml'
+        }
+    )
+    
+    return run_id
+```
+
+### 2.3 Model Registry Integration
+
+```python
+# model_registry.py
+import mlflow
+from mlflow.tracking import MlflowClient
+
+class ModelRegistry:
+    def __init__(self):
+        self.client = MlflowClient()
+        
+    def register_model(self, run_id, model_name="finq_stock_predictor"):
+        """Register model version in MLflow registry"""
+        model_uri = f"runs:/{run_id}/model"
+        
+        # Register the model
+        result = mlflow.register_model(model_uri, model_name)
+        
+        return result.version
+        
+    def promote_model(self, model_name, version, stage="Production"):
+        """Promote model to production stage"""
+        self.client.transition_model_version_stage(
+            name=model_name,
+            version=version,
+            stage=stage
+        )
+        
+    def get_production_model(self, model_name):
+        """Get current production model"""
+        return self.client.get_latest_versions(
+            model_name, 
+            stages=["Production"]
+        )[0]
+```
+
+## 3. Pipeline Orchestration (Airflow)
+
+### 3.1 Airflow DAG Structure
+
+```python
+# dags/finq_stock_predictor_dag.py
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
+from airflow.sensors.filesystem import FileSensor
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'finq-ai-team',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 1, 1),
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5)
+}
+
+dag = DAG(
+    'finq_stock_predictor_pipeline',
+    default_args=default_args,
+    description='FINQ Stock Predictor ML Pipeline',
+    schedule_interval=timedelta(days=1),
+    catchup=False,
+    tags=['ml', 'stocks', 'prediction']
+)
+
+# Task 1: Data Fetching
+fetch_data_task = PythonOperator(
+    task_id='fetch_stock_data',
+    python_callable=fetch_stock_data,
+    dag=dag
+)
+
+# Task 2: Data Quality Check
+data_quality_check = PythonOperator(
+    task_id='data_quality_check',
+    python_callable=validate_data_quality,
+    dag=dag
+)
+
+# Task 3: Feature Engineering
+feature_engineering_task = PythonOperator(
+    task_id='feature_engineering',
+    python_callable=engineer_features,
+    dag=dag
+)
+
+# Task 4: Model Training (conditional)
+model_training_task = PythonOperator(
+    task_id='model_training',
+    python_callable=train_model,
+    dag=dag,
+    # Only run if model performance has degraded
+    depends_on_past=True
+)
+
+# Task 5: Model Evaluation
+model_evaluation_task = PythonOperator(
+    task_id='model_evaluation',
+    python_callable=evaluate_model,
+    dag=dag
+)
+
+# Task 6: Model Deployment
+model_deployment_task = BashOperator(
+    task_id='deploy_model',
+    bash_command='docker-compose up -d --build api',
+    dag=dag
+)
+
+# Task 7: Model Monitoring
+monitoring_task = PythonOperator(
+    task_id='model_monitoring',
+    python_callable=monitor_model_performance,
+    dag=dag
+)
+
+# Define task dependencies
+fetch_data_task >> data_quality_check >> feature_engineering_task
+feature_engineering_task >> model_training_task >> model_evaluation_task
+model_evaluation_task >> model_deployment_task >> monitoring_task
+```
+
+### 3.2 Pipeline Functions
+
+```python
+# pipeline_functions.py
+import pandas as pd
+from datetime import datetime
+from data import get_sp500_data, DataProcessor
+from features import FeatureEngineer
+from models import ModelTrainer
+
+def fetch_stock_data(**context):
+    """Fetch latest stock data"""
+    stock_data, benchmark_data = get_sp500_data()
+    
+    # Save to staging area
+    data_path = f"/tmp/stock_data_{datetime.now().strftime('%Y%m%d')}.pkl"
+    with open(data_path, 'wb') as f:
+        pickle.dump({'stock_data': stock_data, 'benchmark_data': benchmark_data}, f)
+    
+    return data_path
+
+def validate_data_quality(**context):
+    """Validate data quality"""
+    data_path = context['task_instance'].xcom_pull(task_ids='fetch_stock_data')
+    
+    with open(data_path, 'rb') as f:
+        data = pickle.load(f)
+    
+    # Data quality checks
+    checks = {
+        'stock_count': len(data['stock_data']) >= 20,
+        'date_range': (datetime.now() - data['benchmark_data'].index[-1]).days <= 2,
+        'missing_data': all(df.isnull().sum().sum() < len(df) * 0.1 for df in data['stock_data'].values())
+    }
+    
+    if not all(checks.values()):
+        raise ValueError(f"Data quality check failed: {checks}")
+    
+    return True
+
+def engineer_features(**context):
+    """Engineer features from raw data"""
+    data_path = context['task_instance'].xcom_pull(task_ids='fetch_stock_data')
+    
+    # Load and process data
+    engineer = FeatureEngineer()
+    # ... feature engineering logic ...
+    
+    return features_path
+
+def train_model(**context):
+    """Train model if needed"""
+    # Model training logic with MLflow tracking
+    # ... training code ...
+    
+    return model_path
+
+def evaluate_model(**context):
+    """Evaluate model performance"""
+    # Model evaluation logic
+    # ... evaluation code ...
+    
+    return evaluation_results
+
+def monitor_model_performance(**context):
+    """Monitor model performance in production"""
+    # Performance monitoring logic
+    # ... monitoring code ...
+    
+    return monitoring_results
+```
+
+## 4. Alternative: Python Script Chain
+
+For simpler deployment without Airflow:
+
+```python
+# pipeline_runner.py
+import schedule
+import time
+import logging
+from datetime import datetime
+
+class PipelineRunner:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        
+    def run_daily_pipeline(self):
+        """Run the complete daily pipeline"""
+        try:
+            # Step 1: Data fetching
+            self.logger.info("Starting data fetching...")
+            stock_data, benchmark_data = self.fetch_data()
+            
+            # Step 2: Data quality check
+            self.logger.info("Validating data quality...")
+            self.validate_data(stock_data, benchmark_data)
+            
+            # Step 3: Feature engineering
+            self.logger.info("Engineering features...")
+            features = self.engineer_features(stock_data)
+            
+            # Step 4: Model monitoring
+            self.logger.info("Monitoring model performance...")
+            performance = self.monitor_model()
+            
+            # Step 5: Retrain if needed
+            if performance['retrain_needed']:
+                self.logger.info("Retraining model...")
+                self.retrain_model(features)
+            
+            # Step 6: Generate predictions
+            self.logger.info("Generating predictions...")
+            predictions = self.generate_predictions()
+            
+            self.logger.info("Pipeline completed successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Pipeline failed: {str(e)}")
+            # Send alert
+            self.send_alert(str(e))
+            
+    def start_scheduler(self):
+        """Start the pipeline scheduler"""
+        # Schedule daily run at 6 AM
+        schedule.every().day.at("06:00").do(self.run_daily_pipeline)
+        
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+
+if __name__ == "__main__":
+    runner = PipelineRunner()
+    runner.start_scheduler()
+```
+
+## 5. Model Monitoring
+
+### 5.1 Performance Monitoring
+
+```python
+# monitoring.py
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import mlflow
+
+class ModelMonitor:
+    def __init__(self, model_name="finq_stock_predictor"):
+        self.model_name = model_name
+        self.metrics_threshold = {
+            'accuracy': 0.55,
+            'auc': 0.60,
+            'precision': 0.55
+        }
+        
+    def check_model_performance(self, predictions, actuals):
+        """Check if model performance is above threshold"""
+        from sklearn.metrics import accuracy_score, roc_auc_score, precision_score
+        
+        metrics = {
+            'accuracy': accuracy_score(actuals, predictions > 0.5),
+            'auc': roc_auc_score(actuals, predictions),
+            'precision': precision_score(actuals, predictions > 0.5)
+        }
+        
+        # Check if retraining is needed
+        retrain_needed = any(
+            metrics[metric] < threshold 
+            for metric, threshold in self.metrics_threshold.items()
+        )
+        
+        return {
+            'metrics': metrics,
+            'retrain_needed': retrain_needed,
+            'timestamp': datetime.now()
+        }
+        
+    def monitor_data_drift(self, current_features, reference_features):
+        """Monitor for data drift"""
+        from scipy.stats import ks_2samp
+        
+        drift_scores = {}
+        for column in current_features.columns:
+            if column in reference_features.columns:
+                ks_stat, p_value = ks_2samp(
+                    current_features[column].dropna(),
+                    reference_features[column].dropna()
+                )
+                drift_scores[column] = {
+                    'ks_statistic': ks_stat,
+                    'p_value': p_value,
+                    'drift_detected': p_value < 0.05
+                }
+        
+        return drift_scores
+```
+
+### 5.2 Alerting System
+
+```python
+# alerts.py
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import slack_sdk
+
+class AlertSystem:
+    def __init__(self):
+        self.slack_client = slack_sdk.WebClient(token=os.environ["SLACK_TOKEN"])
+        
+    def send_performance_alert(self, metrics):
+        """Send alert for model performance degradation"""
+        message = f"""
+        🚨 Model Performance Alert 🚨
+        
+        Model: {self.model_name}
+        Timestamp: {datetime.now()}
+        
+        Current Metrics:
+        - Accuracy: {metrics['accuracy']:.4f}
+        - AUC: {metrics['auc']:.4f}
+        - Precision: {metrics['precision']:.4f}
+        
+        Action Required: Model retraining recommended
+        """
+        
+        self.slack_client.chat_postMessage(
+            channel="#ai-alerts",
+            text=message
+        )
+        
+    def send_data_drift_alert(self, drift_features):
+        """Send alert for data drift"""
+        message = f"""
+        📊 Data Drift Alert 📊
+        
+        Features with significant drift:
+        {', '.join(drift_features)}
+        
+        Action Required: Review feature engineering and model
+        """
+        
+        self.slack_client.chat_postMessage(
+            channel="#ai-alerts",
+            text=message
+        )
+```
+
+## 6. Deployment Architecture
+
+### 6.1 AWS Infrastructure
+
+```yaml
+# cloudformation/infrastructure.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FINQ Stock Predictor Infrastructure'
+
+Resources:
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: finq-stock-predictor
+      
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: finq-api-alb
+      Scheme: internet-facing
+      Type: application
+      
+  # ECS Service for API
+  APIService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: finq-api
+      TaskDefinition: !Ref APITaskDefinition
+      DesiredCount: 2
+      
+  # RDS for MLflow and application data
+  MLflowDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: finq-mlflow-db
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      
+  # S3 for model artifacts
+  ModelArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: finq-model-artifacts
+      
+  # Lambda for scheduled tasks
+  ScheduledTaskFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: finq-scheduled-tasks
+      Runtime: python3.9
+      Handler: index.handler
+```
+
+### 6.2 Kubernetes Deployment
+
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finq-api
+  namespace: finq-stock-predictor
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: finq-api
+  template:
+    metadata:
+      labels:
+        app: finq-api
+    spec:
+      containers:
+      - name: api
+        image: finq/stock-predictor:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: MODEL_PATH
+          value: "/app/models/production/model.pkl"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-storage-pvc
+```
+
+## 7. Environment Management
+
+### 7.1 Environment Configuration
+
+```python
+# environments/production.py
+import os
+
+class ProductionConfig:
+    # Database
+    DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://user:pass@db:5432/finq')
+    
+    # MLflow
+    MLFLOW_TRACKING_URI = os.environ.get('MLFLOW_TRACKING_URI', 'postgresql://user:pass@mlflow-db:5432/mlflow')
+    
+    # Model storage
+    MODEL_STORAGE_PATH = os.environ.get('MODEL_STORAGE_PATH', '/app/models')
+    
+    # API
+    API_HOST = os.environ.get('API_HOST', '0.0.0.0')
+    API_PORT = int(os.environ.get('API_PORT', 8000))
+    
+    # Monitoring
+    ENABLE_MONITORING = os.environ.get('ENABLE_MONITORING', 'true').lower() == 'true'
+    METRICS_INTERVAL = int(os.environ.get('METRICS_INTERVAL', 300))  # 5 minutes
+    
+    # Alerting
+    SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
+    EMAIL_ALERTS = os.environ.get('EMAIL_ALERTS', 'true').lower() == 'true'
+```
+
+### 7.2 Logging Configuration
+
+```python
+# logging_config.py
+import logging
+from pythonjsonlogger import jsonlogger
+
+def setup_production_logging():
+    """Setup structured logging for production"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # JSON formatter for structured logging
+    formatter = jsonlogger.JsonFormatter(
+        '%(asctime)s %(name)s %(levelname)s %(message)s'
+    )
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler
+    file_handler = logging.FileHandler('/var/log/finq/app.log')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    return logger
+```
+
+## 8. Testing Strategy
+
+### 8.1 Unit Tests
+
+```python
+# tests/test_model_inference.py
+import pytest
+from models.inference import ModelInference
+from datetime import datetime
+
+class TestModelInference:
+    def test_prediction_format(self):
+        """Test prediction output format"""
+        inference = ModelInference()
+        result = inference.predict_single_stock("AAPL", datetime.now())
+        
+        assert 'prediction' in result
+        assert 'confidence' in result
+        assert isinstance(result['prediction'], bool)
+        assert 0 <= result['confidence'] <= 1
+```
+
+### 8.2 Integration Tests
+
+```python
+# tests/test_api_integration.py
+import pytest
+from fastapi.testclient import TestClient
+from api.main import app
+
+class TestAPIIntegration:
+    def setup_method(self):
+        self.client = TestClient(app)
+    
+    def test_health_endpoint(self):
+        """Test health endpoint"""
+        response = self.client.get("/health")
+        assert response.status_code == 200
+        assert "status" in response.json()
+    
+    def test_prediction_endpoint(self):
+        """Test prediction endpoint"""
+        response = self.client.post(
+            "/predict",
+            json={"ticker": "AAPL", "prediction_date": "2025-07-08"}
+        )
+        assert response.status_code == 200
+        assert "prediction" in response.json()
+```
+
+## 9. Security Considerations
+
+### 9.1 API Security
+
+```python
+# security.py
+from fastapi import HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify JWT token"""
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
+        return payload
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
+# Apply to protected endpoints
+@app.post("/predict", dependencies=[Depends(verify_token)])
+async def predict_stock(request: PredictionRequest):
+    # ... prediction logic ...
+```
+
+### 9.2 Environment Security
+
+```bash
+# Use secrets management
+kubectl create secret generic finq-secrets \
+  --from-literal=database-url="postgresql://..." \
+  --from-literal=mlflow-tracking-uri="postgresql://..." \
+  --from-literal=slack-webhook-url="https://hooks.slack.com/..."
+```
+
+## 10. Monitoring and Observability
+
+### 10.1 Prometheus Metrics
+
+```python
+# metrics.py
+from prometheus_client import Counter, Histogram, Gauge
+import time
+
+# Metrics
+prediction_requests_total = Counter('prediction_requests_total', 'Total prediction requests')
+prediction_duration_seconds = Histogram('prediction_duration_seconds', 'Prediction duration')
+model_accuracy_gauge = Gauge('model_accuracy', 'Current model accuracy')
+
+class MetricsMiddleware:
+    def __init__(self, app):
+        self.app = app
+        
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            start_time = time.time()
+            prediction_requests_total.inc()
+            
+            await self.app(scope, receive, send)
+            
+            duration = time.time() - start_time
+            prediction_duration_seconds.observe(duration)
+        else:
+            await self.app(scope, receive, send)
+```
+
+### 10.2 Grafana Dashboard
+
+```json
+{
+  "dashboard": {
+    "title": "FINQ Stock Predictor Dashboard",
+    "panels": [
+      {
+        "title": "Prediction Requests",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(prediction_requests_total[5m])",
+            "legendFormat": "Requests/sec"
+          }
+        ]
+      },
+      {
+        "title": "Model Accuracy",
+        "type": "singlestat",
+        "targets": [
+          {
+            "expr": "model_accuracy",
+            "legendFormat": "Accuracy"
+          }
+        ]
+      },
+      {
+        "title": "Response Time",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, prediction_duration_seconds_bucket)",
+            "legendFormat": "95th percentile"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## Summary
+
+This MLOps plan provides a comprehensive approach to productionizing the FINQ Stock Predictor:
+
+1. **Containerization**: Docker-based deployment with proper health checks
+2. **Experiment Tracking**: MLflow for model versioning and experiment management
+3. **Pipeline Orchestration**: Airflow DAG for automated ML pipeline
+4. **Model Monitoring**: Real-time performance tracking and alerting
+5. **Deployment**: AWS/Kubernetes-ready with proper scaling
+6. **Security**: JWT authentication and secrets management
+7. **Observability**: Prometheus metrics and Grafana dashboards
+
+The plan balances simplicity with production-readiness, ensuring the system can scale while maintaining reliability and observability.
