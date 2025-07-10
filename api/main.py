@@ -16,7 +16,7 @@ from loguru import logger
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from main_config import API_CONFIG, STOCKS_TICKERS
-from models.inference import ModelInference, get_latest_model_path
+from models.inference import ModelInference, get_best_model_path
 
 
 # Pydantic models for request/response
@@ -174,15 +174,26 @@ model_inference = None
 async def startup_event():
     """Initialize the model on startup."""
     global model_inference
-    
+
     try:
-        # Try to load the latest model
-        model_path = get_latest_model_path()
+        # Try to load the best performing model (by AUC score)
+        model_path = get_best_model_path(metric="auc")
         model_inference = ModelInference(model_path)
-        logger.info("Model loaded successfully on startup")
+        logger.info(
+            "Best performing model loaded successfully on startup: {}", model_path
+        )
     except Exception as e:
-        logger.error("Failed to load model on startup: {}", str(e))
-        model_inference = None
+        logger.error("Failed to load best model on startup: {}", str(e))
+        logger.info("Attempting to load latest model as fallback...")
+        try:
+            from models.inference import get_latest_model_path
+
+            model_path = get_latest_model_path()
+            model_inference = ModelInference(model_path)
+            logger.info("Latest model loaded as fallback: {}", model_path)
+        except Exception as fallback_error:
+            logger.error("Failed to load any model: {}", str(fallback_error))
+            model_inference = None
 
 
 @app.get("/", response_model=dict)

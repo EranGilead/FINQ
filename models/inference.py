@@ -21,8 +21,6 @@ from data.fetcher import DataFetcher
 from features.engineer import FeatureEngineer
 
 
-
-
 class ModelInference:
     """
     Handles model inference for stock prediction.
@@ -531,25 +529,214 @@ def get_latest_model_path() -> str:
         FileNotFoundError: If no model files are found
     """
     import glob
-    
+
     # Look for model files in the models directory
     model_patterns = [
         os.path.join(MODELS_DIR, "*.pkl"),
         os.path.join(MODELS_DIR, "saved", "*.pkl")
     ]
-    
+
     model_files = []
     for pattern in model_patterns:
         model_files.extend(glob.glob(pattern))
-    
+
     if not model_files:
         raise FileNotFoundError(f"No model files found in {MODELS_DIR}")
-    
+
     # Return the most recently modified model
     latest_model = max(model_files, key=os.path.getmtime)
     logger.info("Found latest model: {}", latest_model)
-    
+
     return latest_model
+
+
+def get_best_model_path(metric: str = "auc", max_models: int = 50) -> str:
+    """
+    Get the path to the best performing model based on a specified metric.
+
+    Args:
+        metric: Performance metric to use for selection ('auc', 'accuracy', 'f1_score', 'precision', 'recall')
+        max_models: Maximum number of recent models to check (for performance)
+
+    Returns:
+        Path to the best performing model file
+
+    Raises:
+        FileNotFoundError: If no model files are found
+        ValueError: If no valid performance metrics are found
+    """
+    import glob
+    import joblib
+
+    # Look for model files in the models directory
+    model_patterns = [
+        os.path.join(MODELS_DIR, "*.pkl"),
+        os.path.join(MODELS_DIR, "saved", "*.pkl"),
+    ]
+
+    model_files = []
+    for pattern in model_patterns:
+        model_files.extend(glob.glob(pattern))
+
+    if not model_files:
+        raise FileNotFoundError(f"No model files found in {MODELS_DIR}")
+
+    # Sort by modification time (newest first) and limit to max_models for performance
+    model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    if len(model_files) > max_models:
+        logger.info(
+            "Found {} models, checking only the {} most recent for performance",
+            len(model_files),
+            max_models,
+        )
+        model_files = model_files[:max_models]
+
+    best_model = None
+    best_score = -1
+    models_with_scores = []
+    models_checked = 0
+
+    for model_file in model_files:
+        try:
+            model_data = joblib.load(model_file)
+            metadata = model_data.get("metadata", {})
+            models_checked += 1
+
+            # Check for model_scores (validation metrics) or test_scores
+            scores = metadata.get("model_scores") or metadata.get("test_scores", {})
+
+            if scores and metric in scores:
+                score = scores[metric]
+                models_with_scores.append((model_file, score))
+
+                if score > best_score:
+                    best_score = score
+                    best_model = model_file
+
+        except Exception as e:
+            logger.warning("Failed to load model {}: {}", model_file, str(e))
+            continue
+
+    logger.info(
+        "Checked {} models, found {} with {} scores",
+        models_checked,
+        len(models_with_scores),
+        metric,
+    )
+
+    if not best_model:
+        # Fallback to latest model if no performance metrics found
+        logger.warning(
+            "No models found with {} metric, falling back to latest model", metric
+        )
+        return get_latest_model_path()
+
+    logger.info(
+        "Found best model by {}: {} (score: {:.4f})", metric, best_model, best_score
+    )
+
+    # Log comparison of top models
+    if len(models_with_scores) > 1:
+        sorted_models = sorted(models_with_scores, key=lambda x: x[1], reverse=True)
+        logger.info("Top 3 models by {}:", metric)
+        for i, (model_path, score) in enumerate(sorted_models[:3]):
+            model_name = os.path.basename(model_path)
+            logger.info("  {}. {} - {:.4f}", i + 1, model_name, score)
+
+    return best_model
+
+
+def get_model_performance_summary(max_models: int = 50) -> dict:
+    """
+    Get a summary of all model performances.
+
+    Args:
+        max_models: Maximum number of recent models to check (for performance)
+
+    Returns:
+        Dictionary with model performance statistics
+    """
+    import glob
+    import joblib
+
+    model_patterns = [
+        os.path.join(MODELS_DIR, "*.pkl"),
+        os.path.join(MODELS_DIR, "saved", "*.pkl"),
+    ]
+
+    model_files = []
+    for pattern in model_patterns:
+        model_files.extend(glob.glob(pattern))
+
+    if not model_files:
+        return {"error": "No model files found"}
+
+    # Sort by modification time (newest first) and limit to max_models for performance
+    model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    if len(model_files) > max_models:
+        logger.info(
+            "Found {} models, analyzing only the {} most recent for performance",
+            len(model_files),
+            max_models,
+        )
+        model_files = model_files[:max_models]
+
+    performance_data = []
+    metrics = ["auc", "accuracy", "precision", "recall", "f1_score"]
+    models_processed = 0
+
+    for model_file in model_files:
+        try:
+            model_data = joblib.load(model_file)
+            metadata = model_data.get("metadata", {})
+            scores = metadata.get("model_scores") or metadata.get("test_scores", {})
+            models_processed += 1
+
+            if scores:
+                model_info = {
+                    "model_name": os.path.basename(model_file),
+                    "model_type": model_data.get("model_name", "unknown"),
+                    "timestamp": model_data.get("timestamp", "unknown"),
+                    "stocks_count": metadata.get("stocks_count", "unknown"),
+                }
+
+                # Add performance metrics
+                for metric in metrics:
+                    model_info[metric] = scores.get(metric, 0.0)
+
+                performance_data.append(model_info)
+
+        except Exception as e:
+            logger.warning("Failed to load model {}: {}", model_file, str(e))
+            continue
+
+    if not performance_data:
+        logger.warning(
+            "No models with valid performance metrics found after checking {} models",
+            models_processed,
+        )
+        return {"error": "No models with valid performance metrics found"}
+
+    logger.info(
+        "Processed {} models, found {} with valid performance metrics",
+        models_processed,
+        len(performance_data),
+    )
+
+    # Calculate summary statistics
+    summary = {"total_models": len(performance_data), "models": performance_data}
+
+    # Find best models for each metric
+    for metric in metrics:
+        valid_models = [m for m in performance_data if m[metric] > 0]
+        if valid_models:
+            best_model = max(valid_models, key=lambda x: x[metric])
+            summary[f"best_by_{metric}"] = {
+                "model_name": best_model["model_name"],
+                "score": best_model[metric],
+            }
+
+    return summary
 
 
 if __name__ == "__main__":
